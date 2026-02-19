@@ -1,0 +1,21 @@
+# --- 1. Секреты (САМОЕ ВАЖНОЕ) ---
+.env
+credentials.txt
+
+# --- 2. Данные работы скрипта ---
+logs/
+state/
+history/
+mail_history.csv
+
+# --- 3. Генерируемые файлы ---
+*.png
+*.log
+chart_weekly.png
+
+# --- 4. Системный мусор Python ---
+__pycache__/
+*.pyc
+
+# --- 5. Настройки редактора (VS Code) ---
+.vscode/
