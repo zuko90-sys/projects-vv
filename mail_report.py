@@ -109,7 +109,7 @@ def count_emails_robust(email_user: str, password: str, target_date: date, silen
     
     count = 0
     if not silent:
-        print(f"📡 Проверяю дату: {target_date.strftime('%d.%m.%Y')}")
+        print(f"[IMAP] Проверяю дату: {target_date.strftime('%d.%m.%Y')}")
 
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
@@ -119,7 +119,7 @@ def count_emails_robust(email_user: str, password: str, target_date: date, silen
         status, data = mail.search(None, *search_criteria)
         if status != "OK": 
             mail.logout()
-            return 0
+            return -1 # Возвращаем -1 как сигнал ошибки
             
         ids = data[0].split()
         if not ids:
@@ -148,12 +148,12 @@ def count_emails_robust(email_user: str, password: str, target_date: date, silen
         return count
     except Exception as e:
         if not silent: write_log(f"Ошибка IMAP: {e}")
-        return 0
+        return -1 # Возвращаем -1 как сигнал ошибки
 
 
 def get_week_stats(user: str, pwd: str, end_date: date) -> Dict[date, int]:
     stats = {}
-    print("\n📊 Сбор данных за неделю...")
+    print("\n[CHART] Сбор данных за неделю...")
     for i in range(6, -1, -1):
         day = end_date - timedelta(days=i)
         count = count_emails_robust(user, pwd, day, silent=True)
@@ -171,4 +171,145 @@ def create_chart(stats: Dict[date, int], filename: str):
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
     for bar in bars:
-        height =
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height, f'{height}', ha='center', va='bottom')
+
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
+
+def send_report(user: str, pwd: str, subject: str, body: str, attachment_path: str = None):
+    msg = EmailMessage()
+    msg["From"] = user
+    
+    recipients = [user]
+    if REPORT_TO:
+        recipients.append(REPORT_TO)
+    
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    if attachment_path and os.path.exists(attachment_path):
+        ctype, encoding = mimetypes.guess_type(attachment_path)
+        if ctype is None or encoding is not None:
+            ctype = 'application/octet-stream'
+        maintype, subtype = ctype.split('/', 1)
+
+        with open(attachment_path, 'rb') as f:
+            file_data = f.read()
+            msg.add_attachment(file_data, maintype=maintype, subtype=subtype, filename=os.path.basename(attachment_path))
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as s:
+        s.login(user, pwd)
+        s.send_message(msg)
+
+
+def run(mode: str):
+    ensure_dirs()
+    now = datetime.now(TZ)
+    user, pwd = get_credentials()
+    today = now.date()
+    
+    attachment = None 
+    error_msg = None # Переменная для хранения текста ошибки
+
+    if mode == "today":
+        report_date = today
+        date_str = report_date.strftime('%d.%m.%y')
+        period_body = f"{date_str} 00:00-23:59 (Сегодня)"
+        should_record = False 
+        
+        count = count_emails_robust(user, pwd, report_date)
+        if count == -1:
+            error_msg = "Ошибка доступа к данным (сервер Яндекса не ответил)."
+            count = 0
+
+    elif mode == "daily":
+        report_date = today - timedelta(days=1)
+        date_str = report_date.strftime('%d.%m.%y')
+        period_body = f"{date_str} 00:00-23:59 (Вчера)"
+        should_record = True
+        
+        count = count_emails_robust(user, pwd, report_date)
+        if count == -1:
+            error_msg = "Ошибка доступа к данным (сервер Яндекса не ответил)."
+            count = 0
+
+    elif mode == "weekly":
+        report_date = today - timedelta(days=1)
+        start_week = report_date - timedelta(days=6)
+        date_str = f"{start_week.strftime('%d.%m')} - {report_date.strftime('%d.%m.%y')}"
+        period_body = f"Неделя: {date_str}"
+        should_record = True
+        
+        stats = get_week_stats(user, pwd, report_date)
+        # Если хотя бы в одном дне была ошибка (-1)
+        if -1 in stats.values():
+            error_msg = "Ошибка доступа к данным при сборе статистики. График может быть неточным."
+            # Заменяем -1 на 0, чтобы график не сломался
+            stats = {k: (0 if v == -1 else v) for k, v in stats.items()}
+            
+        create_chart(stats, CHART_FILE)
+        attachment = CHART_FILE
+        count = sum(stats.values())
+
+    else:
+        return
+
+    state_file = os.path.join(STATE_DIR, f"{mode}_{report_date}.sent")
+    if should_record and os.path.exists(state_file):
+        print(f"[SKIP] Отчет '{mode}' за {report_date} уже был отправлен.")
+        return
+
+    subj = f"Отчет по письмам по 10 типу [{mode}]: {date_str}"
+    
+    # Формируем тело письма в зависимости от того, была ли ошибка
+    if error_msg:
+        body = (
+            f"Категория: {CATEGORY_LABEL}\n"
+            f"Период: {period_body}\n"
+            f"Время формирования: {now.strftime('%H:%M %d.%m.%y')}\n"
+            f"-----------------\n"
+            f"ВНИМАНИЕ: {error_msg}\n"
+            f"Удалось подсчитать: {count} шт."
+        )
+    else:
+        body = (
+            f"Категория: {CATEGORY_LABEL}\n"
+            f"Период: {period_body}\n"
+            f"Время формирования: {now.strftime('%H:%M %d.%m.%y')}\n"
+            f"-----------------\n"
+            f"Количество писем: {count}"
+        )
+
+    try:
+        send_report(user, pwd, subj, body, attachment_path=attachment)
+        write_log(f"SUCCESS: {mode}, date={report_date}, count={count}")
+        print(f"[SUCCESS] Отправлено: {user}, {REPORT_TO}")
+        
+        # Записываем состояние ТОЛЬКО если письмо реально ушло
+        if should_record:
+            with open(state_file, "w") as f: f.write(now.isoformat())
+            with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([report_date, mode, count])
+
+    except Exception as e:
+        write_log(f"ERROR sending mail: {e}")
+        print(f"Ошибка отправки: {e}")
+        # ГОВОРИМ WINDOWS, ЧТО СКРИПТ УПАЛ (КОД ОШИБКИ 1)
+        sys.exit(1) 
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        run(sys.argv[1])
+    else:
+        now_msk = datetime.now(TZ)
+        if now_msk.weekday() == 0:
+            print("[AUTO] Сегодня Понедельник -> Запуск WEEKLY")
+            run("weekly")
+        else:
+            print("[AUTO] Обычный день -> Запуск DAILY")
+            run("daily")
