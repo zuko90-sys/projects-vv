@@ -14,6 +14,9 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from typing import Tuple, List, Dict
 
+# --- НОВОЕ: Библиотека для Google Таблиц ---
+import gspread
+
 # Настройка для работы графиков в фоне
 import matplotlib
 matplotlib.use('Agg')
@@ -44,6 +47,10 @@ STATE_DIR = os.path.join(BASE_DIR, "state")
 HISTORY_DIR = os.path.join(BASE_DIR, "history")
 HISTORY_FILE = os.path.join(HISTORY_DIR, "mail_history.csv")
 CHART_FILE = os.path.join(BASE_DIR, "chart_weekly.png")
+
+# --- НАСТРОЙКИ GOOGLE ТАБЛИЦ ---
+GOOGLE_KEY_FILE = os.path.join(BASE_DIR, "google_key.json")
+SHEET_NAME = "Статистика по 10 типу"
 
 
 def get_credentials() -> Tuple[str, str]:
@@ -119,7 +126,7 @@ def count_emails_robust(email_user: str, password: str, target_date: date, silen
         status, data = mail.search(None, *search_criteria)
         if status != "OK": 
             mail.logout()
-            return -1 # Возвращаем -1 как сигнал ошибки
+            return -1
             
         ids = data[0].split()
         if not ids:
@@ -148,7 +155,7 @@ def count_emails_robust(email_user: str, password: str, target_date: date, silen
         return count
     except Exception as e:
         if not silent: write_log(f"Ошибка IMAP: {e}")
-        return -1 # Возвращаем -1 как сигнал ошибки
+        return -1
 
 
 def get_week_stats(user: str, pwd: str, end_date: date) -> Dict[date, int]:
@@ -207,6 +214,33 @@ def send_report(user: str, pwd: str, subject: str, body: str, attachment_path: s
         s.send_message(msg)
 
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ GOOGLE ТАБЛИЦ ---
+def append_to_gsheet(report_date: date, mode: str, count: int):
+    if not os.path.exists(GOOGLE_KEY_FILE):
+        print("[GSHEET SKIP] Файл google_key.json не найден.")
+        return
+
+    try:
+        # Авторизуемся по ключу
+        gc = gspread.service_account(filename=GOOGLE_KEY_FILE)
+        # Открываем таблицу по имени
+        sh = gc.open(SHEET_NAME)
+        # Выбираем первый лист
+        worksheet = sh.sheet1
+        
+        # Подготавливаем данные для записи
+        date_str = report_date.strftime('%d.%m.%Y')
+        
+        # Записываем строку
+        worksheet.append_row([date_str, mode, count])
+        print("[GSHEET] Данные успешно записаны в Google Таблицу.")
+        write_log(f"GSHEET SUCCESS: {date_str}, {mode}, {count}")
+    except Exception as e:
+        print(f"[GSHEET ERROR] Ошибка записи в таблицу: {e}")
+        write_log(f"GSHEET ERROR: {e}")
+# ----------------------------------------
+
+
 def run(mode: str):
     ensure_dirs()
     now = datetime.now(TZ)
@@ -214,7 +248,8 @@ def run(mode: str):
     today = now.date()
     
     attachment = None 
-    error_msg = None # Переменная для хранения текста ошибки
+    error_msg = None
+    sunday_count = 0 
 
     if mode == "today":
         report_date = today
@@ -239,22 +274,23 @@ def run(mode: str):
             count = 0
 
     elif mode == "weekly":
-        report_date = today - timedelta(days=1)
-        start_week = report_date - timedelta(days=6)
+        report_date = today - timedelta(days=1) 
+        start_week = report_date - timedelta(days=6) 
         date_str = f"{start_week.strftime('%d.%m')} - {report_date.strftime('%d.%m.%y')}"
         period_body = f"Неделя: {date_str}"
         should_record = True
         
         stats = get_week_stats(user, pwd, report_date)
-        # Если хотя бы в одном дне была ошибка (-1)
+        
         if -1 in stats.values():
             error_msg = "Ошибка доступа к данным при сборе статистики. График может быть неточным."
-            # Заменяем -1 на 0, чтобы график не сломался
             stats = {k: (0 if v == -1 else v) for k, v in stats.items()}
             
         create_chart(stats, CHART_FILE)
         attachment = CHART_FILE
-        count = sum(stats.values())
+        
+        count = sum(stats.values()) 
+        sunday_count = stats.get(report_date, 0) 
 
     else:
         return
@@ -266,41 +302,48 @@ def run(mode: str):
 
     subj = f"Отчет по письмам по 10 типу [{mode}]: {date_str}"
     
-    # Формируем тело письма в зависимости от того, была ли ошибка
+    body_lines = [
+        f"Категория: {CATEGORY_LABEL}",
+        f"Период: {period_body}",
+        f"Время формирования: {now.strftime('%H:%M %d.%m.%y')}",
+        "-----------------"
+    ]
+    
     if error_msg:
-        body = (
-            f"Категория: {CATEGORY_LABEL}\n"
-            f"Период: {period_body}\n"
-            f"Время формирования: {now.strftime('%H:%M %d.%m.%y')}\n"
-            f"-----------------\n"
-            f"ВНИМАНИЕ: {error_msg}\n"
-            f"Удалось подсчитать: {count} шт."
-        )
+        body_lines.append(f"ВНИМАНИЕ: {error_msg}")
+        
+    if mode == "weekly":
+        body_lines.append(f"За вчера (Воскресенье {report_date.strftime('%d.%m')}): {sunday_count} шт.")
+        body_lines.append(f"Всего за неделю: {count} шт.")
     else:
-        body = (
-            f"Категория: {CATEGORY_LABEL}\n"
-            f"Период: {period_body}\n"
-            f"Время формирования: {now.strftime('%H:%M %d.%m.%y')}\n"
-            f"-----------------\n"
-            f"Количество писем: {count}"
-        )
+        if error_msg:
+            body_lines.append(f"Удалось подсчитать: {count} шт.")
+        else:
+            body_lines.append(f"Количество писем: {count}")
+            
+    body = "\n".join(body_lines)
 
     try:
+        # 1. Отправляем письмо
         send_report(user, pwd, subj, body, attachment_path=attachment)
         write_log(f"SUCCESS: {mode}, date={report_date}, count={count}")
         print(f"[SUCCESS] Отправлено: {user}, {REPORT_TO}")
         
-        # Записываем состояние ТОЛЬКО если письмо реально ушло
+        # 2. Если отправка прошла успешно, сохраняем данные
         if should_record:
+            # Создаем файл-метку
             with open(state_file, "w") as f: f.write(now.isoformat())
+            # Пишем в локальный CSV
             with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([report_date, mode, count])
+            
+            # Пишем в облачную Google Таблицу
+            append_to_gsheet(report_date, mode, count)
 
     except Exception as e:
         write_log(f"ERROR sending mail: {e}")
         print(f"Ошибка отправки: {e}")
-        # ГОВОРИМ WINDOWS, ЧТО СКРИПТ УПАЛ (КОД ОШИБКИ 1)
-        sys.exit(1) 
+        sys.exit(1)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
